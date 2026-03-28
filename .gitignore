@@ -1,0 +1,24 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# virtual env
+.venv/
+venv/
+env/
+
+# logs
+scraper.log
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# keep data/ dir structure but not huge data files in git  (optional)
+# Uncomment lines below if you want to EXCLUDE data from git:
+# data/episodes/
+# data/animes.json
