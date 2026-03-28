@@ -45,23 +45,18 @@ Just re-run `python scraper.py` — it will skip already-done items.
 ## 🤖 GitHub Actions
 
 - Schedule: **every ~5h30min** (two cron schedules combined)
-- Needs one secret: **`GH_PAT`** — a Personal Access Token with `repo` scope
+- Uses the built-in **`GITHUB_TOKEN`** (no manual secret needed).
 
-### 🔑 Secret Keys Used
+### 🔑 Permissions & Tokens
 
-| Secret | Where to get | When used |
-|--------|-------------|-----------|
-| `GH_PAT` | GitHub → Settings → Developer settings → PAT (classic) → `repo` scope | Committing & pushing scraped data back to the repo |
+This workflow uses the built-in **`GITHUB_TOKEN`** provided by GitHub. 
 
-> **No paid APIs are used.** The scraper only fetches public pages using `requests` + `BeautifulSoup`.
+> **Important:** Ensure your repository allows GitHub Actions to push commits:
+> 1. Go to your repo on GitHub → **Settings** → **Actions** → **General**
+> 2. Under **Workflow permissions**, select **Read and write permissions**
+> 3. Click **Save**
 
-### Setting up GH_PAT
-
-1. Go to https://github.com/settings/tokens/new
-2. Select scope: `repo` (full control of private repositories)
-3. Copy the token
-4. In your repo → Settings → Secrets and variables → Actions → New secret
-5. Name: `GH_PAT`, value: the token you copied
+> **No paid APIs are used.** The scraper only fetches public pages using `cloudscraper` + `BeautifulSoup`.
 
 ## 📦 JSON Schema
 
