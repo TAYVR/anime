@@ -99,7 +99,7 @@ def load_state() -> dict:
     return {
         "last_page_scraped": 0,
         "scraped_anime_slugs": [],
-        "scraped_episode_slugs": [],
+        "scraped_episode_ids": [],
         "last_run": None,
     }
 
@@ -437,7 +437,7 @@ def run():
     log.info("Phase 2 done.")
 
     # ── PHASE 3 : scrape each episode ────────────────────────────────────
-    already_ep = set(state.get("scraped_episode_slugs", []))
+    already_ep = set(state.get("scraped_episode_ids", []))
     log.info(f"Phase 3: Scraping individual episodes …")
 
     total_eps = sum(len(a.get("episodes", [])) for a in animes.values())
@@ -459,9 +459,9 @@ def run():
             ep_data = scrape_episode(ep_stub)
             save_json(ep_file, ep_data)
             already_ep.add(ep_id)
-            state["scraped_episode_slugs"].append(ep_id)
+            state["scraped_episode_ids"].append(ep_id)
 
-            if len(state["scraped_episode_slugs"]) % 50 == 0:
+            if len(state["scraped_episode_ids"]) % 50 == 0:
                 save_state(state)
 
     ep_bar.close()
