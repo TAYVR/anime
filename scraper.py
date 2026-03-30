@@ -28,9 +28,10 @@ BASE_URL      = "https://animelek.vip"
 LIST_URL      = "https://animelek.vip/قائمة-الأنمي/"
 TOTAL_PAGES   = 83
 DATA_DIR      = Path("data")
-EPISODES_DIR  = DATA_DIR / "episodes"
 STATE_FILE    = Path("state.json")
 ANIMES_FILE   = DATA_DIR / "animes.json"
+ANIMES_SPLIT_PATTERN = "animes_{index}.json"
+MAX_FILE_SIZE_MB = 10
 
 # delays (seconds)
 MIN_DELAY = 1.5
@@ -52,7 +53,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-EPISODES_DIR.mkdir(parents=True, exist_ok=True)
+
 
 # ─────────────────────────────────────────────────────────────── http layer ──
 ua = UserAgent()
@@ -110,6 +111,83 @@ def save_state(state: dict):
 
 
 # ─────────────────────────────────────────────────────────── data helpers  ──
+def load_animes() -> list[dict]:
+    """Load all anime from split files and the legacy single file."""
+    all_animes = []
+    
+    # legacy file
+    if ANIMES_FILE.exists():
+        data = load_json(ANIMES_FILE)
+        if isinstance(data, list):
+            all_animes.extend(data)
+
+    # split files
+    files = list(DATA_DIR.glob("animes_*.json"))
+    # sort files by index to keep things orderly
+    def get_index(f):
+        m = re.search(r"(\d+)", f.name)
+        return int(m.group(1)) if m else 0
+    files.sort(key=get_index)
+
+    for f in files:
+        data = load_json(f)
+        if isinstance(data, list):
+            all_animes.extend(data)
+
+    # deduplicate by slug
+    seen = set()
+    deduped = []
+    for a in all_animes:
+        if a["slug"] not in seen:
+            deduped.append(a)
+            seen.add(a["slug"])
+    return deduped
+
+
+def save_animes(animes_list: list):
+    """Split animes list and save into 10MB chunks."""
+    # 1. Clean up old files to avoid confusion
+    if ANIMES_FILE.exists():
+        try:
+            ANIMES_FILE.unlink()
+        except Exception:
+            pass
+            
+    for f in DATA_DIR.glob("animes_*.json"):
+        try:
+            f.unlink()
+        except Exception:
+            pass
+
+    if not animes_list:
+        return
+
+    # 2. Split and save
+    current_index = 1
+    current_batch = []
+    max_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
+
+    for anime in animes_list:
+        current_batch.append(anime)
+        # approximate size check
+        content = json.dumps(current_batch, ensure_ascii=False, indent=2)
+        if len(content.encode("utf-8")) > max_bytes:
+            if len(current_batch) > 1:
+                # pop last one, save current_batch, then start new batch with the popped one
+                last = current_batch.pop()
+                save_json(DATA_DIR / ANIMES_SPLIT_PATTERN.format(index=current_index), current_batch)
+                current_index += 1
+                current_batch = [last]
+            else:
+                # single anime exceeds limit? save anyway and move on
+                save_json(DATA_DIR / ANIMES_SPLIT_PATTERN.format(index=current_index), current_batch)
+                current_index += 1
+                current_batch = []
+
+    if current_batch:
+        save_json(DATA_DIR / ANIMES_SPLIT_PATTERN.format(index=current_index), current_batch)
+
+
 def load_json(path: Path) -> list | dict:
     if path.exists():
         with open(path, "r", encoding="utf-8") as f:
@@ -391,7 +469,7 @@ def scrape_episode(ep_stub: dict) -> dict:
 # ──────────────────────────────────────────────────────────── main runner  ──
 def run():
     state  = load_state()
-    animes = {a["slug"]: a for a in load_json(ANIMES_FILE)}
+    animes = {a["slug"]: a for a in load_animes()}
 
     log.info("=" * 60)
     log.info("AnimeLek Scraper — starting")
@@ -412,7 +490,7 @@ def run():
             state["last_page_scraped"] = page
             save_state(state)
 
-        save_json(ANIMES_FILE, list(animes.values()))
+        save_animes(list(animes.values()))
         log.info(f"Phase 1 done. Total anime in catalogue: {len(animes)}")
     else:
         log.info("Phase 1 already complete — skipping.")
@@ -429,10 +507,10 @@ def run():
 
         # save incrementally every 10 anime
         if len(state["scraped_anime_slugs"]) % 10 == 0:
-            save_json(ANIMES_FILE, list(animes.values()))
+            save_animes(list(animes.values()))
             save_state(state)
 
-    save_json(ANIMES_FILE, list(animes.values()))
+    save_animes(list(animes.values()))
     save_state(state)
     log.info("Phase 2 done.")
 
@@ -445,27 +523,26 @@ def run():
 
     ep_bar = tqdm(total=total_eps, desc="Episodes")
     for anime in animes.values():
-        for ep_stub in anime.get("episodes", []):
+        for i, ep_stub in enumerate(anime.get("episodes", [])):
             ep_id = ep_stub["id"]
             ep_bar.update(1)
             if ep_id in already_ep:
                 continue
 
-            ep_file = EPISODES_DIR / f"{ep_id}.json"
-            if ep_file.exists():
-                already_ep.add(ep_id)
-                continue
-
             ep_data = scrape_episode(ep_stub)
-            save_json(ep_file, ep_data)
+            # update episode data in-place
+            anime["episodes"][i].update(ep_data)
+            
             already_ep.add(ep_id)
             state["scraped_episode_ids"].append(ep_id)
 
             if len(state["scraped_episode_ids"]) % 50 == 0:
                 save_state(state)
+                save_animes(list(animes.values()))
 
     ep_bar.close()
     save_state(state)
+    save_animes(list(animes.values()))
     log.info("Phase 3 done.")
 
     # ── wrap up ──────────────────────────────────────────────────────────
