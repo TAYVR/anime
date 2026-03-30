@@ -446,20 +446,20 @@ def run():
     ep_bar = tqdm(total=total_eps, desc="Episodes")
     for anime in animes.values():
         for ep_stub in anime.get("episodes", []):
-            slug = ep_stub["slug"]
+            ep_id = ep_stub["id"]
             ep_bar.update(1)
-            if slug in already_ep:
+            if ep_id in already_ep:
                 continue
 
-            ep_file = EPISODES_DIR / f"{slug}.json"
+            ep_file = EPISODES_DIR / f"{ep_id}.json"
             if ep_file.exists():
-                already_ep.add(slug)
+                already_ep.add(ep_id)
                 continue
 
             ep_data = scrape_episode(ep_stub)
             save_json(ep_file, ep_data)
-            already_ep.add(slug)
-            state["scraped_episode_slugs"].append(slug)
+            already_ep.add(ep_id)
+            state["scraped_episode_slugs"].append(ep_id)
 
             if len(state["scraped_episode_slugs"]) % 50 == 0:
                 save_state(state)
