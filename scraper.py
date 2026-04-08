@@ -16,6 +16,7 @@ import logging
 import hashlib
 import urllib.parse
 import cloudscraper
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from pathlib import Path
 from datetime import datetime
@@ -24,9 +25,9 @@ from fake_useragent import UserAgent
 from tqdm import tqdm
 
 # ─────────────────────────────────────────────────────────────────── config ──
-BASE_URL      = "https://animelek.vip"
-LIST_URL      = "https://animelek.vip/قائمة-الأنمي/"
-TOTAL_PAGES   = 83
+BASE_URL      = "https://animelek.top"
+LIST_URL      = "https://animelek.top/قائمة-الأنمي/"
+TOTAL_PAGES   = 84
 DATA_DIR      = Path("data")
 STATE_FILE    = Path("state.json")
 ANIMES_FILE   = DATA_DIR / "animes.json"
@@ -40,6 +41,7 @@ ERROR_DELAY = 10   # wait after an error
 
 # retry
 MAX_RETRIES = 4
+MAX_WORKERS = 3  # Increase to 3+ for faster scraping (User requested x3)
 
 # logging
 logging.basicConfig(
@@ -63,6 +65,9 @@ SESSION = cloudscraper.create_scraper()
 
 def fetch(url: str, retries: int = MAX_RETRIES) -> BeautifulSoup | None:
     """Fetch URL with retry/back-off and return parsed BeautifulSoup."""
+    
+    # Auto-replace old domains from saved states
+    url = url.replace("animelek.vip", "animelek.top")
     
     # URL encode arabic characters safely (handle case where it's already encoded)
     # unquote first to normalize, then quote the non-ascii parts
@@ -145,59 +150,97 @@ def load_animes() -> list[dict]:
 
 
 def save_animes(animes_list: list):
-    """Split animes list and save into 10MB chunks."""
-    # 1. Clean up old files to avoid confusion
-    if ANIMES_FILE.exists():
-        try:
-            ANIMES_FILE.unlink()
-        except Exception:
-            pass
-            
-    for f in DATA_DIR.glob("animes_*.json"):
-        try:
-            f.unlink()
-        except Exception:
-            pass
-
+    """Split animes list and save into 10MB chunks efficiently without losing data on failure."""
     if not animes_list:
         return
 
-    # 2. Split and save
-    current_index = 1
-    current_batch = []
-    max_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
+    temp_files = []
+    try:
+        current_index = 1
+        current_batch = []
+        current_batch_bytes = 10 
+        max_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
 
-    for anime in animes_list:
-        current_batch.append(anime)
-        # approximate size check
-        content = json.dumps(current_batch, ensure_ascii=False, indent=2)
-        if len(content.encode("utf-8")) > max_bytes:
-            if len(current_batch) > 1:
-                # pop last one, save current_batch, then start new batch with the popped one
-                last = current_batch.pop()
-                save_json(DATA_DIR / ANIMES_SPLIT_PATTERN.format(index=current_index), current_batch)
-                current_index += 1
-                current_batch = [last]
-            else:
-                # single anime exceeds limit? save anyway and move on
-                save_json(DATA_DIR / ANIMES_SPLIT_PATTERN.format(index=current_index), current_batch)
+        for anime in animes_list:
+            item_json = json.dumps(anime, ensure_ascii=False, indent=2)
+            item_bytes = len(item_json.encode("utf-8")) + 10 
+            
+            if current_batch_bytes + item_bytes > max_bytes and current_batch:
+                path = DATA_DIR / ANIMES_SPLIT_PATTERN.format(index=current_index)
+                temp_path = path.with_suffix(".tmp_new")
+                save_json(temp_path, current_batch)
+                temp_files.append((temp_path, path))
+                
                 current_index += 1
                 current_batch = []
+                current_batch_bytes = 10
 
-    if current_batch:
-        save_json(DATA_DIR / ANIMES_SPLIT_PATTERN.format(index=current_index), current_batch)
+            current_batch.append(anime)
+            current_batch_bytes += item_bytes
+
+        if current_batch:
+            path = DATA_DIR / ANIMES_SPLIT_PATTERN.format(index=current_index)
+            temp_path = path.with_suffix(".tmp_new")
+            save_json(temp_path, current_batch)
+            temp_files.append((temp_path, path))
+
+        # Successfully written all new parts. Now swap.
+        # 1. Identify all current animes_*.json files
+        old_files = list(DATA_DIR.glob("animes_*.json"))
+        old_files = [f for f in old_files if not f.name.endswith(".tmp_new") and not f.name.endswith(".tmp")]
+
+        # 2. Rename new files to final names
+        for temp_path, final_path in temp_files:
+            if final_path.exists():
+                # On Windows, replace() might fail if open. But save_json already used a .tmp.
+                # Here we just move the .tmp_new to the final path.
+                final_path.unlink(missing_ok=True)
+            temp_path.rename(final_path)
+            
+        # 3. Remove any left-over old files (if we have fewer files now)
+        new_names = {p.name for _, p in temp_files}
+        for f in old_files:
+            if f.name not in new_names:
+                try: f.unlink()
+                except: pass
+
+        if ANIMES_FILE.exists():
+            try: ANIMES_FILE.unlink()
+            except: pass
+
+    except Exception as e:
+        log.error(f"Critical error during save_animes: {e}")
+        for temp_path, _ in temp_files:
+            if temp_path.exists(): 
+                try: temp_path.unlink()
+                except: pass
 
 
 def load_json(path: Path) -> list | dict:
-    if path.exists():
+    if not path.exists():
+        return []
+    try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    return []
+    except Exception as e:
+        log.warning(f"File {path.name} could not be loaded: {e}. Returning empty.")
+        return []
 
 
 def save_json(path: Path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    """Save JSON atomically to avoid corruption upon interrupt."""
+    temp_path = path.with_suffix(".tmp")
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        # atomic rename
+        if path.exists():
+            path.unlink()
+        temp_path.rename(path)
+    except Exception as e:
+        log.error(f"Failed to save {path.name}: {e}")
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def slug_from_url(url: str) -> str:
@@ -215,7 +258,6 @@ def parse_anime_card(card) -> dict | None:
     """Parse a single card div into a dict."""
     try:
         # 1. find link (the slug and main url)
-        # Look for a.overlay or basically any link to /anime/
         link_tag = card.select_one("a[href*='/anime/']")
         if not link_tag:
             return None
@@ -232,13 +274,10 @@ def parse_anime_card(card) -> dict | None:
 
         # 3. find title
         title = ""
-        # try alt from img
         if img_tag:
             title = img_tag.get("alt", "").strip()
-        # try the title attribute from link
         if not title:
             title = link_tag.get("title", "").strip()
-        # try to find a h3 or h2 or .title
         if not title:
             title_el = card.find(["h3", "h2", "h1"]) or card.select_one(".title, .anime-card-title")
             if title_el:
@@ -248,9 +287,8 @@ def parse_anime_card(card) -> dict | None:
         status_el = card.select_one(".anime-card-status, .status, [class*='status']")
         status = status_el.get_text(strip=True) if status_el else ""
 
-        # clean title: remove " انمي" suffix
+        # clean title
         title = re.sub(r"\s+انمي\s*$", "", title).strip()
-
         slug = slug_from_url(url)
 
         return {
@@ -262,7 +300,7 @@ def parse_anime_card(card) -> dict | None:
             "status": status,
         }
     except Exception as e:
-        log.warning(f"  Card parse error for {getattr(card, 'name', 'tag')}: {e}")
+        log.warning(f"  Card parse error: {e}")
         return None
 
 
@@ -271,10 +309,9 @@ def scrape_list_page(page: int) -> list[dict]:
     url = LIST_URL if page == 1 else f"{LIST_URL}?page={page}"
     soup = fetch(url)
     if not soup:
-        log.error(f"  Page {page}: Failed to fetch or empty response.")
+        log.error(f"  Page {page}: Failed to fetch.")
         return []
 
-    # Try multiple selectors — site may vary
     cards = (
         soup.select(".anime-card-container")
         or soup.select(".anime-card-poster")
@@ -282,12 +319,7 @@ def scrape_list_page(page: int) -> list[dict]:
         or soup.select("[class*='anime-card']") 
     )
 
-    if cards:
-        log.info(f"  Page {page}: Found {len(cards)} elements matching card selectors.")
-    else:
-        log.warning(f"  Page {page}: No elements matched card selectors. Trying fallback...")
-        # Fallback: find all links to /anime/ that are likely cards
-        # We look for links to /anime/ that contain an image
+    if not cards:
         links = soup.select("a[href*='/anime/']")
         potential_cards = []
         for a in links:
@@ -295,24 +327,20 @@ def scrape_list_page(page: int) -> list[dict]:
             if parent and parent.find("img"):
                 potential_cards.append(parent)
         
-        # Unique cards by object ID
         seen = set()
         cards = []
         for c in potential_cards:
             if id(c) not in seen:
                 seen.add(id(c))
                 cards.append(c)
-        log.info(f"  Page {page}: Fallback found {len(cards)} potential card containers.")
 
     results = []
     for c in cards:
         anime = parse_anime_card(c)
         if anime:
             results.append(anime)
-        else:
-            log.debug("  A card failed to parse.")
 
-    log.info(f"  Page {page}: {len(results)} anime successfully parsed.")
+    log.info(f"  Page {page}: {len(results)} anime parsed.")
     return results
 
 
@@ -321,30 +349,23 @@ def parse_anime_detail(soup: BeautifulSoup, stub: dict) -> dict:
     """Enrich anime stub with metadata from the anime detail page."""
     anime = stub.copy()
 
-    # ── title (native from <h1>) ─────────────────────────────────────────
     h1 = soup.find("h1")
     if h1:
         anime["title"] = h1.get_text(strip=True)
 
-    # ── description ──────────────────────────────────────────────────────
     desc_el = soup.select_one("p.anime-story") or soup.select_one(".anime-story p") or soup.select_one(".anime-story")
     anime["description"] = desc_el.get_text(strip=True) if desc_el else ""
 
-    # ── metadata table (genre, type, year, studios, …) ──────────────────
     meta: dict = {}
-    # Preferred: .full-list-info as found by subagent
-    # Fallback: .anime-info li
     meta_rows = soup.select(".anime-container-infos .full-list-info") or soup.select(".anime-info li")
     
     for row in meta_rows:
         label_el = row.find("span") or row.find("strong")
-        if not label_el:
-            continue
+        if not label_el: continue
         label = label_el.get_text(strip=True).strip(":")
         value = row.get_text(strip=True).replace(label, "").strip().strip(":")
         meta[label] = value
 
-    # common keys used on the site (Arabic)
     anime["genres"]    = [a.get_text(strip=True) for a in soup.select("a[href*='/anime-genre/'], .anime-genres a")]
     anime["type"]      = meta.get("النوع",  meta.get("Type", ""))
     anime["year"]      = meta.get("السنة",  meta.get("Year", ""))
@@ -352,23 +373,13 @@ def parse_anime_detail(soup: BeautifulSoup, stub: dict) -> dict:
     anime["studios"]   = meta.get("الإستوديو", meta.get("Studio", ""))
     anime["status"]    = stub.get("status") or meta.get("الحالة", meta.get("Status", ""))
 
-    # Try to get the poster from og:image if not set
     if not anime.get("poster"):
         og = soup.find("meta", property="og:image")
-        if og:
-            anime["poster"] = og.get("content", "")
+        if og: anime["poster"] = og.get("content", "")
 
-    # ── episodes list ────────────────────────────────────────────────────
     episode_links = []
     seen = set()
-    
-    # Try multiple selectors for episodes links
-    ep_selectors = [
-        ".episodes-card-container a.overlay", 
-        ".episodes-card a.overlay",
-        ".ep-card-anime-title-detail a",
-        "a[href*='/episode/']"
-    ]
+    ep_selectors = [".episodes-card-container a.overlay", ".episodes-card a.overlay", "a[href*='/episode/']"]
     
     for selector in ep_selectors:
         for a in soup.select(selector):
@@ -376,7 +387,6 @@ def parse_anime_detail(soup: BeautifulSoup, stub: dict) -> dict:
             if href and href not in seen:
                 seen.add(href)
                 ep_slug = slug_from_url(href)
-                # extract episode number from slug
                 ep_num = _extract_ep_number(ep_slug, a)
                 episode_links.append({
                     "id":     make_id(href),
@@ -392,77 +402,45 @@ def parse_anime_detail(soup: BeautifulSoup, stub: dict) -> dict:
 
 
 def _extract_ep_number(slug: str, tag) -> str:
-    """Try to extract episode number from slug or anchor text."""
-    # From link text
     text = tag.get_text(strip=True)
     m = re.search(r"(\d+)", text)
-    if m:
-        return m.group(1)
-    # From slug  e.g. assassins-pride-3-الحلقة
+    if m: return m.group(1)
     m = re.search(r"-(\d+)-", slug)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     return ""
 
 
 def scrape_anime_detail(stub: dict) -> dict:
-    """Fetch & parse the anime detail page."""
     soup = fetch(stub["url"])
-    if not soup:
-        return stub
-    return parse_anime_detail(soup, stub)
+    return parse_anime_detail(soup, stub) if soup else stub
 
 
 # ─────────────────────────────────────── page 3: episode detail scraping  ──
 def parse_server_links(soup: BeautifulSoup, section_id: str) -> list[dict]:
-    """Parse watch-servers or download-links list."""
     section = soup.find("div", id=section_id)
-    if not section:
-        return []
-
+    if not section: return []
     links = []
     for li in section.select("li.watch"):
         a = li.find("a")
-        if not a:
-            continue
-        # quality from class  e.g. "watch -HD"
-        quality = " ".join(
-            c.lstrip("-") for c in li.get("class", []) if c.startswith("-")
-        )
-        # server name from text
+        if not a: continue
+        quality = " ".join(c.lstrip("-") for c in li.get("class", []) if c.startswith("-"))
         server   = a.get_text(strip=True)
-        data_url = a.get("data-ep-url", "").strip()
-        href     = a.get("href", "").strip()
-        url      = data_url or href
-
+        url      = a.get("data-ep-url", "").strip() or a.get("href", "").strip()
         if url and url not in ("#", ""):
-            links.append({
-                "server":  server,
-                "quality": quality,
-                "url":     url,
-            })
+            links.append({"server": server, "quality": quality, "url": url})
     return links
 
 
 def scrape_episode(ep_stub: dict) -> dict:
-    """Fetch episode page and extract watch servers + download links."""
     ep = ep_stub.copy()
     soup = fetch(ep["url"])
     if not soup:
-        ep["watch_servers"]    = []
-        ep["download_links"]   = []
-        ep["scraped_at"]       = datetime.utcnow().isoformat()
-        return ep
-
+        ep["watch_servers"] = []; ep["download_links"] = []; return ep
     ep["watch_servers"]  = parse_server_links(soup, "watch")
     ep["download_links"] = parse_server_links(soup, "downloads")
     ep["scraped_at"]     = datetime.utcnow().isoformat()
-
-    # thumbnail
     thumb = soup.find("meta", property="og:image")
-    if thumb:
-        ep["thumbnail"] = thumb.get("content", "")
-
+    if thumb: ep["thumbnail"] = thumb.get("content", "")
     return ep
 
 
@@ -473,86 +451,102 @@ def run():
 
     log.info("=" * 60)
     log.info("AnimeLek Scraper — starting")
-    log.info(f"  Already have {len(animes)} anime in catalogue")
-    log.info(f"  Last page scraped: {state['last_page_scraped']}")
+    log.info(f"  Catalogue: {len(animes)} anime")
+    log.info(f"  Last Page: {state['last_page_scraped']}")
     log.info("=" * 60)
 
-    # ── PHASE 1 : scrape all listing pages to collect stubs ─────────────
-    start_page = state["last_page_scraped"] + 1
-    if start_page <= TOTAL_PAGES:
-        log.info(f"Phase 1: Scraping listing pages {start_page}–{TOTAL_PAGES} …")
-        for page in tqdm(range(start_page, TOTAL_PAGES + 1), desc="List pages"):
-            stubs = scrape_list_page(page)
-            for stub in stubs:
-                if stub["slug"] not in animes:
-                    animes[stub["slug"]] = stub
-
-            state["last_page_scraped"] = page
-            save_state(state)
+    # ── PHASE 1 : collect anime stubs ───────────────────────────────────
+    if state["last_page_scraped"] < TOTAL_PAGES:
+        log.info(f"Phase 1: Resuming from page {state['last_page_scraped'] + 1} …")
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            pages = range(state["last_page_scraped"] + 1, TOTAL_PAGES + 1)
+            f_to_p = {executor.submit(scrape_list_page, p): p for p in pages}
+            
+            for f in tqdm(as_completed(f_to_p), total=len(f_to_p), desc="List pages"):
+                p = f_to_p[f]
+                try:
+                    stubs = f.result()
+                    for s in stubs:
+                        if s["slug"] not in animes: animes[s["slug"]] = s
+                    
+                    # Update progress
+                    if p > state["last_page_scraped"]:
+                        state["last_page_scraped"] = p
+                        # Save state more frequently in Phase 1
+                        if p % 5 == 0 or p == TOTAL_PAGES:
+                            save_state(state)
+                            save_animes(list(animes.values()))
+                except Exception as e:
+                    log.error(f"Error page {p}: {e}")
 
         save_animes(list(animes.values()))
-        log.info(f"Phase 1 done. Total anime in catalogue: {len(animes)}")
+        save_state(state)
+        log.info(f"Phase 1 done. Total: {len(animes)}")
     else:
-        log.info("Phase 1 already complete — skipping.")
+        log.info("Phase 1 already complete.")
 
-    # ── PHASE 2 : enrich each anime with detail page ─────────────────────
+    # ── PHASE 2 : enrich metadata ────────────────────────────────────────
     already_detailed = set(state.get("scraped_anime_slugs", []))
-    need_detail = [a for slug, a in animes.items() if slug not in already_detailed]
-    log.info(f"Phase 2: Enriching {len(need_detail)} anime pages …")
+    need_detail = [a for s, a in animes.items() if s not in already_detailed or "description" not in a]
+    
+    if need_detail:
+        log.info(f"Phase 2: Enriching {len(need_detail)} anime …")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            f_to_a = {executor.submit(scrape_anime_detail, s): s for s in need_detail}
+            for i, f in enumerate(tqdm(as_completed(f_to_a), total=len(f_to_a), desc="Details"), 1):
+                try:
+                    res = f.result()
+                    animes[res["slug"]] = res
+                    state["scraped_anime_slugs"].append(res["slug"])
+                    if i % 20 == 0:
+                        save_animes(list(animes.values()))
+                        save_state(state)
+                except Exception as e: log.error(f"Error detail: {e}")
 
-    for stub in tqdm(need_detail, desc="Anime details"):
-        enriched = scrape_anime_detail(stub)
-        animes[enriched["slug"]] = enriched
-        state["scraped_anime_slugs"].append(enriched["slug"])
-
-        # save incrementally every 10 anime
-        if len(state["scraped_anime_slugs"]) % 10 == 0:
-            save_animes(list(animes.values()))
-            save_state(state)
-
-    save_animes(list(animes.values()))
-    save_state(state)
+        save_animes(list(animes.values()))
+        save_state(state)
     log.info("Phase 2 done.")
 
-    # ── PHASE 3 : scrape each episode ────────────────────────────────────
+    # ── PHASE 3 : scrape episodes ────────────────────────────────────────
     already_ep = set(state.get("scraped_episode_ids", []))
-    log.info(f"Phase 3: Scraping individual episodes …")
+    tasks = []
+    for s, a in animes.items():
+        for i, ep in enumerate(a.get("episodes", [])):
+            if ep["id"] not in already_ep or not ep.get("watch_servers"):
+                tasks.append((s, i, ep))
 
-    total_eps = sum(len(a.get("episodes", [])) for a in animes.values())
-    log.info(f"  Total episodes to potentially scrape: {total_eps}")
+    if tasks:
+        log.info(f"Phase 3: Scraping {len(tasks)} episodes …")
+        ep_bar = tqdm(total=len(tasks) + len(already_ep), initial=len(already_ep), desc="Episodes")
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            f_to_e = {executor.submit(scrape_episode, t[2]): t for t in tasks}
+            for i, f in enumerate(as_completed(f_to_e), 1):
+                try:
+                    slug, idx, _ = f_to_e[f]
+                    data = f.result()
+                    if slug in animes:
+                        animes[slug]["episodes"][idx].update(data)
+                    if data["id"] not in already_ep:
+                        state["scraped_episode_ids"].append(data["id"])
+                        already_ep.add(data["id"])
+                    ep_bar.update(1)
 
-    ep_bar = tqdm(total=total_eps, desc="Episodes")
-    for anime in animes.values():
-        for i, ep_stub in enumerate(anime.get("episodes", [])):
-            ep_id = ep_stub["id"]
-            ep_bar.update(1)
-            if ep_id in already_ep:
-                continue
+                    if i % 50 == 0: # Save more frequently (every 50 episodes)
+                        save_state(state)
+                        save_animes(list(animes.values()))
+                except Exception as e: 
+                    log.error(f"Error episode: {e}")
+                    ep_bar.update(1)
+        ep_bar.close()
+        save_state(state)
+        save_animes(list(animes.values()))
 
-            ep_data = scrape_episode(ep_stub)
-            # update episode data in-place
-            anime["episodes"][i].update(ep_data)
-            
-            already_ep.add(ep_id)
-            state["scraped_episode_ids"].append(ep_id)
-
-            if len(state["scraped_episode_ids"]) % 50 == 0:
-                save_state(state)
-                save_animes(list(animes.values()))
-
-    ep_bar.close()
-    save_state(state)
-    save_animes(list(animes.values()))
-    log.info("Phase 3 done.")
-
-    # ── wrap up ──────────────────────────────────────────────────────────
     state["last_run"] = datetime.utcnow().isoformat()
     save_state(state)
-    log.info("=" * 60)
     log.info("Scrape complete ✓")
-    log.info(f"  Anime: {len(animes)}")
-    log.info(f"  Episodes: {len(already_ep)}")
-    log.info("=" * 60)
+
 
 
 if __name__ == "__main__":

@@ -1,13 +1,8 @@
 name: AnimeLek Auto Scraper
 
 on:
-  # Run every 5 hours 30 minutes
   schedule:
-    - cron: "0 */5 * * *"   # every 5 hours  (closest cron allows)
-    # Note: GitHub Actions cron minimum is 5min intervals.
-    # True 5h30 isn't expressible in a single cron line, so we
-    # combine two schedules: run at :00 and :30 of every 5th hour.
-    - cron: "30 4,9,14,19 * * *"   # 04:30 / 09:30 / 14:30 / 19:30 UTC daily
+    - cron: "0 */6 * * *"   # Run every 6 hours
 
   # Allow manual trigger from the GitHub UI
   workflow_dispatch:
@@ -18,7 +13,7 @@ permissions:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 320   # 5h20 safety cap
+    timeout-minutes: 360   # 6h limit for the job
 
     steps:
       # ── 1. Checkout repo ------------------------------------------------
@@ -41,7 +36,7 @@ jobs:
 
       # ── 4. Run scraper ---------------------------------------------------
       - name: Run AnimeLek scraper
-        run: python scraper.py
+        run: timeout 5h python scraper.py || true
         env:
           # No secret keys needed — uses only free public scraping
           PYTHONUNBUFFERED: "1"
