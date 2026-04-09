@@ -379,24 +379,38 @@ def parse_anime_detail(soup: BeautifulSoup, stub: dict) -> dict:
 
     episode_links = []
     seen = set()
-    ep_selectors = [".episodes-card-container a.overlay", ".episodes-card a.overlay", "a[href*='/episode/']"]
-    
-    for selector in ep_selectors:
-        for a in soup.select(selector):
-            href = a.get("href", "").strip()
-            if href and href not in seen:
-                seen.add(href)
-                ep_slug = slug_from_url(href)
-                ep_num = _extract_ep_number(ep_slug, a)
-                episode_links.append({
-                    "id":     make_id(href),
-                    "slug":   ep_slug,
-                    "url":    href,
-                    "number": ep_num,
-                })
+    # New structure: ul.episodes-lists li a[href*='/episode/']
+    # Each li has multiple <a> tags; we want the one with class 'title' or any with episode href
+    for li in soup.select("ul.episodes-lists li"):
+        # prefer the 'title' link, fallback to any episode link in the li
+        a = li.select_one("a.title[href*='/episode/']") or li.select_one("a[href*='/episode/']")
+        if not a:
+            continue
+        href = a.get("href", "").strip()
+        if not href or href in seen:
+            continue
+        seen.add(href)
+        ep_slug = slug_from_url(href)
+        # Try to get number from li data-number attribute first
+        li_num = li.get("data-number", "")
+        ep_num = li_num if li_num else _extract_ep_number(ep_slug, a)
+        episode_links.append({
+            "id":     make_id(href),
+            "slug":   ep_slug,
+            "url":    href,
+            "number": ep_num,
+        })
 
-    anime["episodes_count"] = len(episode_links)
-    anime["episodes"]       = episode_links
+    # Deduplicate by id (two ul lists may repeat same episodes)
+    seen_ids = set()
+    deduped_eps = []
+    for ep in episode_links:
+        if ep["id"] not in seen_ids:
+            deduped_eps.append(ep)
+            seen_ids.add(ep["id"])
+
+    anime["episodes_count"] = len(deduped_eps)
+    anime["episodes"]       = deduped_eps
     anime["scraped_at"]     = datetime.utcnow().isoformat()
     return anime
 
@@ -416,18 +430,34 @@ def scrape_anime_detail(stub: dict) -> dict:
 
 
 # ─────────────────────────────────────── page 3: episode detail scraping  ──
-def parse_server_links(soup: BeautifulSoup, section_id: str) -> list[dict]:
-    section = soup.find("div", id=section_id)
-    if not section: return []
+def parse_watch_servers(soup: BeautifulSoup) -> list[dict]:
+    """Parse watch servers from ul.server-list li a.option[data-embed]."""
+    servers = []
+    for a in soup.select("ul.server-list li a.option[data-embed]"):
+        embed_url = a.get("data-embed", "").strip()
+        if not embed_url or embed_url == "#":
+            continue
+        server_span = a.select_one("span.server")
+        server_name = server_span.get_text(strip=True) if server_span else a.get_text(strip=True)
+        servers.append({"server": server_name, "url": embed_url})
+    return servers
+
+
+def parse_download_links(soup: BeautifulSoup) -> list[dict]:
+    """Parse download links from #download table rows."""
     links = []
-    for li in section.select("li.watch"):
-        a = li.find("a")
-        if not a: continue
-        quality = " ".join(c.lstrip("-") for c in li.get("class", []) if c.startswith("-"))
-        server   = a.get_text(strip=True)
-        url      = a.get("data-ep-url", "").strip() or a.get("href", "").strip()
-        if url and url not in ("#", ""):
-            links.append({"server": server, "quality": quality, "url": url})
+    for row in soup.select("#download table tbody tr"):
+        a = row.select_one("td a[href]")
+        if not a:
+            continue
+        href = a.get("href", "").strip()
+        if not href or href == "#":
+            continue
+        quality_el = row.select_one("strong.badge")
+        quality = quality_el.get_text(strip=True) if quality_el else ""
+        lang_el = row.select_one("span.badge")
+        language = lang_el.get_text(strip=True) if lang_el else ""
+        links.append({"url": href, "quality": quality, "language": language})
     return links
 
 
@@ -436,8 +466,8 @@ def scrape_episode(ep_stub: dict) -> dict:
     soup = fetch(ep["url"])
     if not soup:
         ep["watch_servers"] = []; ep["download_links"] = []; return ep
-    ep["watch_servers"]  = parse_server_links(soup, "watch")
-    ep["download_links"] = parse_server_links(soup, "downloads")
+    ep["watch_servers"]  = parse_watch_servers(soup)
+    ep["download_links"] = parse_download_links(soup)
     ep["scraped_at"]     = datetime.utcnow().isoformat()
     thumb = soup.find("meta", property="og:image")
     if thumb: ep["thumbnail"] = thumb.get("content", "")
@@ -445,22 +475,28 @@ def scrape_episode(ep_stub: dict) -> dict:
 
 
 # ──────────────────────────────────────────────────────────── main runner  ──
-def run():
+def run(test_mode: bool = False):
+    """Main scraper runner.
+    test_mode: scrape only 4 pages & 3 animes with 1 episode each, then exit.
+    """
     state  = load_state()
     animes = {a["slug"]: a for a in load_animes()}
 
     log.info("=" * 60)
-    log.info("AnimeLek Scraper — starting")
+    log.info(f"AnimeLek Scraper — {'TEST MODE' if test_mode else 'starting'}")
     log.info(f"  Catalogue: {len(animes)} anime")
     log.info(f"  Last Page: {state['last_page_scraped']}")
     log.info("=" * 60)
 
+    total_pages = 4 if test_mode else TOTAL_PAGES
+    max_animes  = 3 if test_mode else None
+
     # ── PHASE 1 : collect anime stubs ───────────────────────────────────
-    if state["last_page_scraped"] < TOTAL_PAGES:
+    if state["last_page_scraped"] < total_pages:
         log.info(f"Phase 1: Resuming from page {state['last_page_scraped'] + 1} …")
         
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            pages = range(state["last_page_scraped"] + 1, TOTAL_PAGES + 1)
+            pages = range(state["last_page_scraped"] + 1, total_pages + 1)
             f_to_p = {executor.submit(scrape_list_page, p): p for p in pages}
             
             for f in tqdm(as_completed(f_to_p), total=len(f_to_p), desc="List pages"):
@@ -468,13 +504,11 @@ def run():
                 try:
                     stubs = f.result()
                     for s in stubs:
-                        if s["slug"] not in animes: animes[s["slug"]] = s
-                    
-                    # Update progress
+                        if s["slug"] not in animes:
+                            animes[s["slug"]] = s
                     if p > state["last_page_scraped"]:
                         state["last_page_scraped"] = p
-                        # Save state more frequently in Phase 1
-                        if p % 5 == 0 or p == TOTAL_PAGES:
+                        if p % 5 == 0 or p == total_pages:
                             save_state(state)
                             save_animes(list(animes.values()))
                 except Exception as e:
@@ -489,7 +523,9 @@ def run():
     # ── PHASE 2 : enrich metadata ────────────────────────────────────────
     already_detailed = set(state.get("scraped_anime_slugs", []))
     need_detail = [a for s, a in animes.items() if s not in already_detailed or "description" not in a]
-    
+    if max_animes:
+        need_detail = need_detail[:max_animes]
+
     if need_detail:
         log.info(f"Phase 2: Enriching {len(need_detail)} anime …")
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -512,7 +548,16 @@ def run():
     already_ep = set(state.get("scraped_episode_ids", []))
     tasks = []
     for s, a in animes.items():
+        # In test mode, only include animes that were just enriched
+        if max_animes and s not in already_detailed and s not in [x["slug"] for x in need_detail if "slug" in x]:
+            # limit to enriched animes only in test
+            pass
+        eps = a.get("episodes", [])
+        if test_mode:
+            eps = eps[:1]  # In test mode just scrape 1 episode per anime
         for i, ep in enumerate(a.get("episodes", [])):
+            if test_mode and i >= 1:
+                break
             if ep["id"] not in already_ep or not ep.get("watch_servers"):
                 tasks.append((s, i, ep))
 
@@ -533,7 +578,7 @@ def run():
                         already_ep.add(data["id"])
                     ep_bar.update(1)
 
-                    if i % 50 == 0: # Save more frequently (every 50 episodes)
+                    if i % 50 == 0:
                         save_state(state)
                         save_animes(list(animes.values()))
                 except Exception as e: 
@@ -548,6 +593,18 @@ def run():
     log.info("Scrape complete ✓")
 
 
-
 if __name__ == "__main__":
-    run()
+    import argparse
+    parser = argparse.ArgumentParser(description="AnimeLek Scraper")
+    parser.add_argument("--test",  action="store_true", help="Test mode: 4 pages, 3 animes, 1 ep each")
+    parser.add_argument("--reset", action="store_true", help="Delete all data and state, start fresh")
+    args = parser.parse_args()
+
+    if args.reset:
+        import shutil
+        log.info("Resetting all data …")
+        if STATE_FILE.exists():   STATE_FILE.unlink()
+        for f in DATA_DIR.glob("animes*.json"): f.unlink()
+        log.info("Reset complete. Run without --reset to start scraping.")
+    else:
+        run(test_mode=args.test)
