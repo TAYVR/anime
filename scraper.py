@@ -27,7 +27,7 @@ from tqdm import tqdm
 # ─────────────────────────────────────────────────────────────────── config ──
 BASE_URL      = "https://animelek.top"
 LIST_URL      = "https://animelek.top/قائمة-الأنمي/"
-TOTAL_PAGES   = 84
+TOTAL_PAGES   = 102
 DATA_DIR      = Path("data")
 STATE_FILE    = Path("state.json")
 ANIMES_FILE   = DATA_DIR / "animes.json"
